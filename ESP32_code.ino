@@ -12,18 +12,16 @@ WebServer server(80);
 #define IBUS_TX_PIN 17
 #define CHANNELS 14
 
-uint16_t channels[CHANNELS] = {1500,1500,1500,1000,1000,1000,1000,1000,1500,1500,1500,1500,1500,1500};
+uint16_t channels[CHANNELS] = {
+  1500,1500,1500,1000,  // AETR: Roll, Pitch, Yaw, Throttle
+  1000,1000,1000,1000,  // AUX1–AUX4
+  1500,1500,1500,1500,1500,1500
+};
 
 // ================== UDP Config ==================
 WiFiUDP udp;
 const int udpPort = 1234;
 char incomingPacket[255];
-
-// ================== Connection & Failsafe ==================
-bool throttleOk = false;
-bool udpConnected = false;
-unsigned long lastPacketTime = 0;
-const unsigned long timeout = 1000; // 1s
 
 // ================== AUX States ==================
 bool auxState[4] = {false,false,false,false};
@@ -42,27 +40,28 @@ String buildHTML() {
   String html = "<!DOCTYPE html><html><head><title>ESP Drone Modes</title><style>";
   html += "body{font-family:Arial;text-align:center;background:#1a1a1a;color:white;}";
   html += "h1{margin-top:20px;} .buttons{display:grid;grid-template-columns:repeat(2,150px);grid-gap:20px;justify-content:center;margin-top:50px;}";
-  html += ".switch {position: relative;display: inline-block;width: 60px;height: 34px;} .switch input{display:none;}";
+  html += ".switch{position:relative;display:inline-block;width:60px;height:34px;} .switch input{display:none;}";
   html += ".slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#ccc;transition:.4s;border-radius:34px;}";
   html += ".slider:before{position:absolute;content:'';height:26px;width:26px;left:4px;bottom:4px;background:white;transition:.4s;border-radius:50%;}";
-  html += "input:checked + .slider{background:#4CAF50;} input:checked + .slider:before{transform:translateX(26px);}";
+  html += "input:checked + .slider{background:#4CAF50;} input:checked + .slider:before{transform:translateX(26px);} ";
   html += ".status{margin-top:30px;font-size:18px;}</style></head><body>";
   html += "<h1>ESP Drone Modes</h1><div class='buttons'>";
+
   for(int i=1;i<=4;i++){
-    html += "<label class='switch'> <input type='checkbox' onclick='toggle("+String(i)+")' ";
-    if(auxState[i-1]) html += "checked";
-    html += "> <span class='slider'></span> </label> Mode "+String(i);
+    html += "<label class='switch'> <input type='checkbox' id='aux"+String(i)+"' onchange='toggle("+String(i)+")'> <span class='slider'></span></label> Mode "+String(i);
   }
-  html += "</div><div class='status'>";
-  html += "Throttle: "+String((channels[3]-1000)*100/1000)+"%<br>";
-  html += "Roll: "+String((channels[0]-1000)*100/1000)+"%<br>";
-  html += "Pitch: "+String((channels[1]-1000)*100/1000)+"%<br>";
-  html += "Yaw: "+String((channels[2]-1000)*100/1000)+"%<br>";
-  html += "UDP connected: "+String(udpConnected?"Yes":"No")+"<br>";
-  html += "Failsafe active: "+String((!throttleOk||!udpConnected)?"Yes":"No")+"</div>";
-  // JS to toggle aux
-  html += "<script>function toggle(ch){fetch('/aux?ch='+ch);} setInterval(()=>{location.reload();},1000);</script>";
-  html += "</body></html>";
+
+  html += "</div><div class='status' id='status'></div>";
+
+  // JavaScript for instant updates
+  html += "<script>";
+  html += "function toggle(ch){fetch('/aux?ch='+ch);} ";
+  html += "async function update(){let r=await fetch('/status');let j=await r.json();";
+  html += "document.getElementById('status').innerHTML=";
+  html += "'Throttle: '+j.throttle+'%<br>Roll: '+j.roll+'%<br>Pitch: '+j.pitch+'%<br>Yaw: '+j.yaw;";
+  html += "for(let i=1;i<=4;i++){document.getElementById('aux'+i).checked=j['aux'+i];}}";
+  html += "setInterval(update,1000); update();";
+  html += "</script></body></html>";
   return html;
 }
 
@@ -78,6 +77,20 @@ void handleAux() {
   } else {
     server.send(400,"text/plain","Bad Request");
   }
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"throttle\":" + String((channels[3]-1000)*100/1000) + ",";
+  json += "\"roll\":" + String((channels[0]-1000)*100/1000) + ",";
+  json += "\"pitch\":" + String((channels[1]-1000)*100/1000) + ",";
+  json += "\"yaw\":" + String((channels[2]-1000)*100/1000) + ",";
+  for(int i=1;i<=4;i++){
+    json += "\"aux"+String(i)+"\":"+(auxState[i-1]?"true":"false");
+    if(i<4) json += ",";
+  }
+  json += "}";
+  server.send(200,"application/json",json);
 }
 
 // ================== iBUS Packet Send ==================
@@ -104,6 +117,7 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/aux", handleAux);
+  server.on("/status", handleStatus);
   server.begin();
   Serial.println("[Web] Server started");
 
@@ -116,6 +130,12 @@ void setup() {
 
 // ================== Loop ==================
 void loop() {
+  // if WiFi disconnected → stop output (FC will failsafe)
+  if (WiFi.softAPgetStationNum() == 0) {
+    delay(50);
+    return;
+  }
+
   server.handleClient();
 
   int packetSize = udp.parsePacket();
@@ -134,29 +154,13 @@ void loop() {
         udpChannels[i]=constrain(atoi(buf),1000,2000);
       }
 
-      if(!throttleOk && udpChannels[0]<1500){
-        throttleOk=true;
-        Serial.println("[INFO] Throttle OK, ready to send iBUS");
-      }
-
-      channels[0] = udpChannels[2]; // Roll
-      channels[1] = 3000 - udpChannels[3]; // Pitch (inverted)
-      channels[2] = udpChannels[1]; // Yaw
-      channels[3] = udpChannels[0]; // Throttle
-
-      lastPacketTime=millis();
-      udpConnected=true;
+      channels[0] = udpChannels[2];           // Roll
+      channels[1] = 3000 - udpChannels[3];    // Pitch (inverted)
+      channels[2] = udpChannels[1];           // Yaw
+      channels[3] = udpChannels[0];           // Throttle
     }
   }
 
-  if(millis()-lastPacketTime>timeout){
-    udpConnected=false;
-    if(throttleOk){
-      channels[0]=1500; channels[1]=1500; channels[2]=1500; channels[3]=1000;
-      Serial.println("[FAILSAFE] UDP timeout, channels set to safe");
-    }
-  }
-
-  if(throttleOk && udpConnected) sendIBUS();
+  sendIBUS();
   delay(7);
 }
